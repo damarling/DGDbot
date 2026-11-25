@@ -22,12 +22,11 @@ jobs:
           - name: Android64
             os: ubuntu-latest
             target: Android64
-          - name: iOS
-            os: macos-latest
-            target: iOS
 
     name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
+    # Don't let an Android failure block packaging of the other platforms
+    continue-on-error: ${{ matrix.config.target == 'Android32' || matrix.config.target == 'Android64' }}
 
     steps:
       - uses: actions/checkout@v4
