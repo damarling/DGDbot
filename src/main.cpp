@@ -568,7 +568,7 @@ protected:
 
         m_noElasticity = true;
         auto win = CCDirector::get()->getWinSize();
-        m_center = {win.width / 2.f, win.height / 2.f};
+        m_center = CCPoint(win.width / 2.f, win.height / 2.f);
 
         m_mainLayer = CCLayer::create();
         this->addChild(m_mainLayer);
