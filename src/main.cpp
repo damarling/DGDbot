@@ -44,6 +44,7 @@ struct ReplayState {
     bool playArmed = false;   // user pressed "Play"
     bool playing = false;     // actively playing back right now
     size_t cursor = 0;
+    int startFrame = 0; // frame counter value when the run (re)started; replays are relative to it
 
     // Safe mode bookkeeping (replay runs are never saved)
     bool forcedTest = false;
@@ -226,7 +227,8 @@ void refreshStatus() {
     if (!pl || !pl->m_uiLayer) return;
     auto label = typeinfo_cast<CCLabelBMFont*>(pl->m_uiLayer->getChildByID("status-label"_spr));
     if (!label) return;
-    if (S.recording || S.playing) {
+    bool show = Mod::get()->getSettingValue<bool>("show-status-label");
+    if (show && (S.recording || S.playing)) {
         label->setString(S.recording ? "REC" : "REPLAY - SAFE MODE");
         label->setVisible(true);
     } else {
@@ -289,51 +291,62 @@ void actionPlay() {
     refreshStatus();
 }
 
-void actionImport() {
+struct MacroEntry {
+    std::filesystem::path path;
+    std::string name;
+    bool imported = false;
+    std::filesystem::file_time_type time{};
+};
+
+// Every .gdr in replays/ (recorded/exported) and replays/import/ (imported), newest first.
+std::vector<MacroEntry> listMacros() {
+    std::vector<MacroEntry> out;
+    auto dir = replayDir();
+    std::error_code ec;
+    std::filesystem::create_directories(dir / "import", ec);
+
+    auto scan = [&out](std::filesystem::path const& folder, bool imported) {
+        std::error_code ec1;
+        for (auto const& e : std::filesystem::directory_iterator(folder, ec1)) {
+            std::error_code ec2;
+            if (!e.is_regular_file(ec2)) continue;
+            auto ext = e.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext != ".gdr") continue;
+            auto t = e.last_write_time(ec2);
+            if (ec2) continue;
+            MacroEntry m;
+            m.path = e.path();
+            m.name = pathToUtf8(e.path().stem());
+            m.imported = imported;
+            m.time = t;
+            out.push_back(std::move(m));
+        }
+    };
+    scan(dir, false);
+    scan(dir / "import", true);
+
+    std::sort(out.begin(), out.end(), [](MacroEntry const& a, MacroEntry const& b) {
+        return a.time > b.time;
+    });
+    return out;
+}
+
+// Loads a macro file into memory (with the same safety checks as before).
+void useMacro(MacroEntry const& entry) {
     auto pl = PlayLayer::get();
     if (!pl) return;
 
-    auto dir = replayDir() / "import";
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-
-    std::filesystem::path newest;
-    std::filesystem::file_time_type best{};
-    bool found = false;
-    for (auto const& e : std::filesystem::directory_iterator(dir, ec)) {
-        std::error_code ec2;
-        if (!e.is_regular_file(ec2)) continue;
-        auto ext = e.path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext != ".gdr") continue;
-        auto t = e.last_write_time(ec2);
-        if (ec2) continue;
-        if (!found || t > best) {
-            best = t;
-            newest = e.path();
-            found = true;
-        }
-    }
-
-    if (!found) {
-        FLAlertLayer::create(
-            "Import",
-            fmt::format("Put a .gdr file in this folder, then press Import again:\n{}", pathToUtf8(dir)),
-            "OK"
-        )->show();
-        return;
-    }
-
-    auto r = parseGdr(readFile(newest));
+    auto r = parseGdr(readFile(entry.path));
     if (!r.ok) {
-        FLAlertLayer::create("Import failed", r.error, "OK")->show();
+        FLAlertLayer::create("Can't use macro", r.error, "OK")->show();
         return;
     }
     if (r.framerate != kFramerate) {
         FLAlertLayer::create(
-            "Import failed",
-            fmt::format("This replay is {} TPS, but this mod only supports {} TPS.", r.framerate, kFramerate),
+            "Can't use macro",
+            fmt::format("This macro is {} TPS, but this mod only supports {} TPS.", r.framerate, kFramerate),
             "OK"
         )->show();
         return;
@@ -341,7 +354,7 @@ void actionImport() {
     if (r.hasLevel && r.levelId != S.levelID) {
         FLAlertLayer::create(
             "Wrong level",
-            fmt::format("This replay is for level ID {}, but you are in level ID {}.", r.levelId, S.levelID),
+            fmt::format("This macro is for level ID {}, but you are in level ID {}.", r.levelId, S.levelID),
             "OK"
         )->show();
         return;
@@ -351,12 +364,7 @@ void actionImport() {
     S.checkpoints.clear();
     S.recordArmed = S.recording = false;
     S.playArmed = S.playing = false;
-    FLAlertLayer::create(
-        "Imported",
-        fmt::format("Loaded {} inputs from:\n{}\n\nTurn practice mode off, press Play, then restart the level.",
-                    S.inputs.size(), pathToUtf8(newest)),
-        "OK"
-    )->show();
+    toast(fmt::format("Loaded \"{}\" ({} inputs). Tick Play, then restart", entry.name, S.inputs.size()));
     refreshStatus();
 }
 
@@ -400,7 +408,7 @@ class $modify(RPPlayLayer, PlayLayer) {
     CheckpointObject* createCheckpoint() {
         auto cp = PlayLayer::createCheckpoint();
         if (cp && S.recording) {
-            S.checkpoints[cp] = static_cast<int>(m_gameState.m_currentProgress);
+            S.checkpoints[cp] = static_cast<int>(m_gameState.m_currentProgress) - S.startFrame;
         }
         return cp;
     }
@@ -431,6 +439,12 @@ class $modify(RPPlayLayer, PlayLayer) {
 
         S.cursor = 0;
 
+        // Fresh start (level start OR start position): remember where the frame counter is.
+        // Start positions may not begin at frame 0, so everything is stored relative to this.
+        if (target == 0) {
+            S.startFrame = static_cast<int>(m_gameState.m_currentProgress);
+        }
+
         if (!m_isPracticeMode && S.playArmed && !S.inputs.empty()) {
             // ---- start playback (normal mode)
             S.playing = true;
@@ -448,6 +462,8 @@ class $modify(RPPlayLayer, PlayLayer) {
             } else if (S.recording && target > 0) {
                 // ---- died & respawned at a checkpoint: drop everything after it
                 std::erase_if(S.inputs, [target](Input const& i) { return i.frame >= target; });
+            } else if (S.recordArmed && !S.recording) {
+                toast("Can't start recording from a checkpoint. Remove checkpoints & restart from the start");
             }
         }
 
@@ -501,7 +517,7 @@ class $modify(RPBaseGameLayer, GJBaseGameLayer) {
 
             if (S.recording) {
                 S.inputs.push_back({
-                    static_cast<int>(m_gameState.m_currentProgress),
+                    static_cast<int>(m_gameState.m_currentProgress) - S.startFrame,
                     button,
                     !isPlayer1,
                     down
@@ -513,7 +529,7 @@ class $modify(RPBaseGameLayer, GJBaseGameLayer) {
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (S.playing && static_cast<GJBaseGameLayer*>(this) == static_cast<GJBaseGameLayer*>(PlayLayer::get())) {
-            int frame = static_cast<int>(m_gameState.m_currentProgress);
+            int frame = static_cast<int>(m_gameState.m_currentProgress) - S.startFrame;
             while (S.cursor < S.inputs.size() && S.inputs[S.cursor].frame <= frame) {
                 auto const& in = S.inputs[S.cursor++];
                 // Calls the ORIGINAL handler, so our own hook's "ignore input" check is skipped.
@@ -524,11 +540,210 @@ class $modify(RPBaseGameLayer, GJBaseGameLayer) {
     }
 };
 
+// ----------------------------------------------------------- Macros menu ---
+
+class ReplayMenu;
+
+class MacrosMenu : public FLAlertLayer {
+protected:
+    static constexpr size_t kPerPage = 5;
+
+    std::vector<MacroEntry> m_entries;
+    size_t m_page = 0;
+    std::vector<CCNode*> m_rowButtons;
+    CCNode* m_labels = nullptr;
+    CCLabelBMFont* m_pageLabel = nullptr;
+    CCPoint m_center;
+
+    CCMenuItemSpriteExtra* addButton(char const* text, int width, float scale, CCPoint pos, SEL_MenuHandler sel) {
+        auto spr = ButtonSprite::create(text, width, true, "bigFont.fnt", "GJ_button_01.png", 30.f, scale);
+        auto btn = CCMenuItemSpriteExtra::create(spr, this, sel);
+        btn->setPosition(pos);
+        m_buttonMenu->addChild(btn);
+        return btn;
+    }
+
+    bool setupMenu() {
+        if (!FLAlertLayer::init(150)) return false;
+
+        m_noElasticity = true;
+        auto win = CCDirector::get()->getWinSize();
+        m_center = {win.width / 2.f, win.height / 2.f};
+
+        m_mainLayer = CCLayer::create();
+        this->addChild(m_mainLayer);
+
+        auto bg = CCScale9Sprite::create("GJ_square01.png", {0.f, 0.f, 80.f, 80.f});
+        bg->setContentSize({340.f, 320.f});
+        bg->setPosition(m_center);
+        m_mainLayer->addChild(bg, -1);
+
+        auto title = CCLabelBMFont::create("Macros", "goldFont.fnt");
+        title->setScale(0.8f);
+        title->setPosition({m_center.x, m_center.y + 140.f});
+        m_mainLayer->addChild(title);
+
+        m_labels = CCNode::create();
+        m_mainLayer->addChild(m_labels);
+
+        m_pageLabel = CCLabelBMFont::create("1/1", "bigFont.fnt");
+        m_pageLabel->setScale(0.45f);
+        m_pageLabel->setPosition({m_center.x, m_center.y - 85.f});
+        m_mainLayer->addChild(m_pageLabel);
+
+        m_buttonMenu = CCMenu::create();
+        m_buttonMenu->setPosition(m_center);
+        m_mainLayer->addChild(m_buttonMenu);
+
+        addButton("<", 30, 0.6f, {-70.f, -85.f}, menu_selector(MacrosMenu::onPrev));
+        addButton(">", 30, 0.6f, {70.f, -85.f}, menu_selector(MacrosMenu::onNext));
+
+        addButton("Export", 80, 0.6f, {-100.f, -125.f}, menu_selector(MacrosMenu::onExport));
+        addButton("Import", 80, 0.6f, {0.f, -125.f}, menu_selector(MacrosMenu::onImportInfo));
+        addButton("Back", 80, 0.6f, {100.f, -125.f}, menu_selector(MacrosMenu::onBack));
+
+        m_entries = listMacros();
+        buildPage();
+
+        this->setTouchEnabled(true);
+        this->setKeypadEnabled(true);
+        return true;
+    }
+
+    void buildPage() {
+        for (auto node : m_rowButtons) node->removeFromParentAndCleanup(true);
+        m_rowButtons.clear();
+        m_labels->removeAllChildrenWithCleanup(true);
+
+        size_t pages = std::max<size_t>(1, (m_entries.size() + kPerPage - 1) / kPerPage);
+        if (m_page >= pages) m_page = pages - 1;
+
+        if (m_entries.empty()) {
+            auto none = CCLabelBMFont::create("No macros yet.\nExport a recording or tap Import.", "bigFont.fnt");
+            none->setScale(0.4f);
+            none->setPosition({m_center.x, m_center.y + 30.f});
+            m_labels->addChild(none);
+        }
+
+        for (size_t i = 0; i < kPerPage; i++) {
+            size_t idx = m_page * kPerPage + i;
+            if (idx >= m_entries.size()) break;
+            auto const& entry = m_entries[idx];
+            float y = 95.f - 36.f * static_cast<float>(i);
+
+            auto name = CCLabelBMFont::create(entry.name.c_str(), "bigFont.fnt");
+            float width = name->getContentSize().width;
+            float scale = width > 0.f ? std::min(0.45f, 190.f / width) : 0.45f;
+            name->setScale(scale);
+            name->setAnchorPoint({0.f, 0.5f});
+            name->setPosition({m_center.x - 150.f, m_center.y + y + 6.f});
+            m_labels->addChild(name);
+
+            auto tag = CCLabelBMFont::create(entry.imported ? "Imported" : "Recorded", "bigFont.fnt");
+            tag->setScale(0.28f);
+            tag->setOpacity(150);
+            tag->setAnchorPoint({0.f, 0.5f});
+            tag->setPosition({m_center.x - 150.f, m_center.y + y - 9.f});
+            m_labels->addChild(tag);
+
+            auto btn = addButton("Use", 50, 0.6f, {115.f, y}, menu_selector(MacrosMenu::onUse));
+            btn->setTag(static_cast<int>(idx));
+            m_rowButtons.push_back(btn);
+        }
+
+        m_pageLabel->setString(fmt::format("{}/{}", m_page + 1, pages).c_str());
+    }
+
+    void rescan() {
+        m_entries = listMacros();
+        buildPage();
+    }
+
+    void onUse(CCObject* sender) {
+        size_t idx = static_cast<size_t>(static_cast<CCNode*>(sender)->getTag());
+        if (idx < m_entries.size()) useMacro(m_entries[idx]);
+    }
+
+    void onPrev(CCObject*) {
+        if (m_page > 0) m_page--;
+        buildPage();
+    }
+
+    void onNext(CCObject*) {
+        m_page++;
+        buildPage();
+    }
+
+    void onExport(CCObject*) {
+        actionExport();
+        rescan();
+    }
+
+    void onImportInfo(CCObject*) {
+        FLAlertLayer::create(
+            "Import",
+            fmt::format(
+                "Put your .gdr files in this folder:\n{}\n\nThen come back here. The list refreshes now.",
+                pathToUtf8(replayDir() / "import")
+            ),
+            "OK"
+        )->show();
+        rescan();
+    }
+
+    void onBack(CCObject*); // defined after ReplayMenu
+
+    void keyBackClicked() override { this->onBack(nullptr); }
+
+public:
+    static MacrosMenu* create() {
+        auto ret = new MacrosMenu();
+        if (ret && ret->setupMenu()) {
+            ret->autorelease();
+            return ret;
+        }
+        CC_SAFE_DELETE(ret);
+        return nullptr;
+    }
+};
+
 // ----------------------------------------------------------- Replay menu ---
 
 class ReplayMenu : public FLAlertLayer {
 protected:
     CCLabelBMFont* m_status = nullptr;
+    CCSprite* m_recordOn = nullptr;
+    CCSprite* m_playOn = nullptr;
+    CCSprite* m_textOn = nullptr;
+
+    // A checkbox: both sprites are kept so we control exactly which one is shown.
+    CCSprite* addCheck(char const* text, SEL_MenuHandler sel, CCPoint center, float y, bool state) {
+        auto off = CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png");
+        auto on = CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png");
+        auto size = off->getContentSize();
+        CCPoint mid = {size.width / 2.f, size.height / 2.f};
+        off->setPosition(mid);
+        on->setPosition(mid);
+        on->setVisible(state);
+
+        auto wrap = CCNode::create();
+        wrap->ignoreAnchorPointForPosition(false);
+        wrap->setContentSize(size);
+        wrap->addChild(off);
+        wrap->addChild(on);
+
+        auto btn = CCMenuItemSpriteExtra::create(wrap, this, sel);
+        btn->setPosition({-105.f, y});
+        m_buttonMenu->addChild(btn);
+
+        auto label = CCLabelBMFont::create(text, "bigFont.fnt");
+        label->setScale(0.42f);
+        label->setAnchorPoint({0.f, 0.5f});
+        label->setPosition({center.x - 80.f, center.y + y});
+        m_mainLayer->addChild(label);
+
+        return on;
+    }
 
     bool setupMenu() {
         if (!FLAlertLayer::init(150)) return false;
@@ -541,49 +756,66 @@ protected:
         this->addChild(m_mainLayer);
 
         auto bg = CCScale9Sprite::create("GJ_square01.png", {0.f, 0.f, 80.f, 80.f});
-        bg->setContentSize({260.f, 270.f});
+        bg->setContentSize({280.f, 260.f});
         bg->setPosition(center);
         m_mainLayer->addChild(bg, -1);
 
-        auto title = CCLabelBMFont::create("Practice Replay", "goldFont.fnt");
+        auto title = CCLabelBMFont::create("DGDbot", "goldFont.fnt");
         title->setScale(0.8f);
-        title->setPosition({center.x, center.y + 115.f});
+        title->setPosition({center.x, center.y + 110.f});
         m_mainLayer->addChild(title);
 
         m_status = CCLabelBMFont::create(statusText().c_str(), "bigFont.fnt");
         m_status->setScale(0.4f);
-        m_status->setPosition({center.x, center.y + 88.f});
+        m_status->setPosition({center.x, center.y + 85.f});
         m_mainLayer->addChild(m_status);
 
         m_buttonMenu = CCMenu::create();
         m_buttonMenu->setPosition(center);
         m_mainLayer->addChild(m_buttonMenu);
 
-        auto add = [this](char const* text, SEL_MenuHandler sel, float y, float scale) {
-            auto spr = ButtonSprite::create(text, 120, true, "bigFont.fnt", "GJ_button_01.png", 30.f, scale);
-            auto btn = CCMenuItemSpriteExtra::create(spr, this, sel);
-            btn->setPosition({0.f, y});
-            m_buttonMenu->addChild(btn);
-        };
-        add("Record", menu_selector(ReplayMenu::onRecord), 52.f, 0.7f);
-        add("Play", menu_selector(ReplayMenu::onPlay), 12.f, 0.7f);
-        add("Import", menu_selector(ReplayMenu::onImport), -28.f, 0.7f);
-        add("Export", menu_selector(ReplayMenu::onExport), -68.f, 0.7f);
-        add("Close", menu_selector(ReplayMenu::onCloseBtn), -105.f, 0.55f);
+        m_recordOn = addCheck("Record (practice mode)", menu_selector(ReplayMenu::onRecord), center, 50.f, S.recordArmed);
+        m_playOn = addCheck("Play (normal mode)", menu_selector(ReplayMenu::onPlay), center, 15.f, S.playArmed);
+
+        auto spr = ButtonSprite::create("Macros", 120, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.7f);
+        auto macros = CCMenuItemSpriteExtra::create(spr, this, menu_selector(ReplayMenu::onMacros));
+        macros->setPosition({0.f, -25.f});
+        m_buttonMenu->addChild(macros);
+
+        m_textOn = addCheck("Show REC / REPLAY text", menu_selector(ReplayMenu::onToggleText), center, -62.f,
+                            Mod::get()->getSettingValue<bool>("show-status-label"));
+
+        auto closeSpr = ButtonSprite::create("Close", 120, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.55f);
+        auto close = CCMenuItemSpriteExtra::create(closeSpr, this, menu_selector(ReplayMenu::onCloseBtn));
+        close->setPosition({0.f, -98.f});
+        m_buttonMenu->addChild(close);
 
         this->setTouchEnabled(true);
         this->setKeypadEnabled(true);
         return true;
     }
 
-    void refresh() {
+    void sync() {
         if (m_status) m_status->setString(statusText().c_str());
+        if (m_recordOn) m_recordOn->setVisible(S.recordArmed);
+        if (m_playOn) m_playOn->setVisible(S.playArmed);
     }
 
-    void onRecord(CCObject*) { actionRecord(); refresh(); }
-    void onPlay(CCObject*) { actionPlay(); refresh(); }
-    void onImport(CCObject*) { actionImport(); refresh(); }
-    void onExport(CCObject*) { actionExport(); refresh(); }
+    void onRecord(CCObject*) { actionRecord(); sync(); }
+    void onPlay(CCObject*) { actionPlay(); sync(); }
+
+    void onToggleText(CCObject*) {
+        bool now = !Mod::get()->getSettingValue<bool>("show-status-label");
+        Mod::get()->setSettingValue<bool>("show-status-label", now);
+        if (m_textOn) m_textOn->setVisible(now);
+        refreshStatus();
+    }
+
+    void onMacros(CCObject*) {
+        auto macros = MacrosMenu::create();
+        this->onCloseBtn(nullptr);
+        if (macros) macros->show();
+    }
 
     void onCloseBtn(CCObject*) {
         this->setKeypadEnabled(false);
@@ -604,6 +836,13 @@ public:
     }
 };
 
+void MacrosMenu::onBack(CCObject*) {
+    auto menu = ReplayMenu::create();
+    this->setKeypadEnabled(false);
+    this->removeFromParentAndCleanup(true);
+    if (menu) menu->show();
+}
+
 // ----------------------------------------------------------- PauseLayer ---
 
 class $modify(RPPauseLayer, PauseLayer) {
@@ -615,10 +854,10 @@ class $modify(RPPauseLayer, PauseLayer) {
         menu->setID("replay-menu"_spr);
         menu->setPosition({0.f, 0.f});
 
-        auto spr = ButtonSprite::create("Replay", 90, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.6f);
+        auto spr = ButtonSprite::create("Replay", 56, true, "bigFont.fnt", "GJ_button_01.png", 22.f, 0.45f);
         auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(RPPauseLayer::onRPOpen));
         btn->setID("replay-button"_spr);
-        btn->setPosition({70.f, winSize.height / 2.f});
+        btn->setPosition({winSize.width - 40.f, winSize.height / 2.f});
         menu->addChild(btn);
 
         this->addChild(menu);
