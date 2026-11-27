@@ -6,6 +6,9 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/ui/Notification.hpp>
+#if __has_include(<Geode/ui/BasedButtonSprite.hpp>)
+#include <Geode/ui/BasedButtonSprite.hpp>
+#endif
 
 // Geode v6 returns asp::fs::Path from Mod::getSaveDir(); this header converts to std::filesystem.
 #include <asp/fs/std.hpp>
@@ -454,6 +457,7 @@ class $modify(RPPlayLayer, PlayLayer) {
 
             if (!m_isPracticeMode) {
                 S.recording = false; // left practice mode -> stop recording
+                S.recordArmed = false;
             } else if (S.recordArmed && target == 0) {
                 // ---- fresh run from the start: (re)start recording
                 S.recording = true;
@@ -490,10 +494,14 @@ class $modify(RPPlayLayer, PlayLayer) {
             toast("Safe mode: replay runs are not saved");
         }
 
-        if (wasRecording && !S.inputs.empty()) {
+        if (wasRecording) {
+            // Recording is one-shot: finishing the level saves it and turns Record off.
             S.recording = false;
-            if (saveReplay(replayPath())) {
-                toast("Replay auto-saved");
+            S.recordArmed = false;
+            if (!S.inputs.empty() && saveReplay(replayPath())) {
+                toast("Recording finished & saved. Record turned off");
+            } else {
+                toast("Recording finished. Record turned off");
             }
         }
         refreshStatus();
@@ -756,38 +764,40 @@ protected:
         this->addChild(m_mainLayer);
 
         auto bg = CCScale9Sprite::create("GJ_square01.png", {0.f, 0.f, 80.f, 80.f});
-        bg->setContentSize({280.f, 260.f});
+        bg->setContentSize({280.f, 230.f});
         bg->setPosition(center);
         m_mainLayer->addChild(bg, -1);
 
         auto title = CCLabelBMFont::create("DGDbot", "goldFont.fnt");
         title->setScale(0.8f);
-        title->setPosition({center.x, center.y + 110.f});
+        title->setPosition({center.x, center.y + 92.f});
         m_mainLayer->addChild(title);
 
         m_status = CCLabelBMFont::create(statusText().c_str(), "bigFont.fnt");
         m_status->setScale(0.4f);
-        m_status->setPosition({center.x, center.y + 85.f});
+        m_status->setPosition({center.x, center.y + 67.f});
         m_mainLayer->addChild(m_status);
 
         m_buttonMenu = CCMenu::create();
         m_buttonMenu->setPosition(center);
         m_mainLayer->addChild(m_buttonMenu);
 
-        m_recordOn = addCheck("Record (practice mode)", menu_selector(ReplayMenu::onRecord), center, 50.f, S.recordArmed);
-        m_playOn = addCheck("Play (normal mode)", menu_selector(ReplayMenu::onPlay), center, 15.f, S.playArmed);
+        m_recordOn = addCheck("Record (practice mode)", menu_selector(ReplayMenu::onRecord), center, 35.f, S.recordArmed);
+        m_playOn = addCheck("Play (normal mode)", menu_selector(ReplayMenu::onPlay), center, 2.f, S.playArmed);
 
         auto spr = ButtonSprite::create("Macros", 120, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.7f);
         auto macros = CCMenuItemSpriteExtra::create(spr, this, menu_selector(ReplayMenu::onMacros));
-        macros->setPosition({0.f, -25.f});
+        macros->setPosition({0.f, -34.f});
         m_buttonMenu->addChild(macros);
 
-        m_textOn = addCheck("Show REC / REPLAY text", menu_selector(ReplayMenu::onToggleText), center, -62.f,
+        m_textOn = addCheck("Show REC / REPLAY text", menu_selector(ReplayMenu::onToggleText), center, -72.f,
                             Mod::get()->getSettingValue<bool>("show-status-label"));
 
-        auto closeSpr = ButtonSprite::create("Close", 120, true, "bigFont.fnt", "GJ_button_01.png", 30.f, 0.55f);
-        auto close = CCMenuItemSpriteExtra::create(closeSpr, this, menu_selector(ReplayMenu::onCloseBtn));
-        close->setPosition({0.f, -98.f});
+        // Close: an X in the top-left corner
+        auto xSpr = CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png");
+        xSpr->setScale(0.75f);
+        auto close = CCMenuItemSpriteExtra::create(xSpr, this, menu_selector(ReplayMenu::onCloseBtn));
+        close->setPosition({-128.f, 101.f});
         m_buttonMenu->addChild(close);
 
         this->setTouchEnabled(true);
@@ -854,7 +864,10 @@ class $modify(RPPauseLayer, PauseLayer) {
         menu->setID("replay-menu"_spr);
         menu->setPosition({0.f, 0.f});
 
-        auto spr = ButtonSprite::create("Replay", 56, true, "bigFont.fnt", "GJ_button_01.png", 22.f, 0.45f);
+        auto icon = CCLabelBMFont::create("Bot", "bigFont.fnt");
+        icon->setScale(0.45f);
+        auto spr = CircleButtonSprite::create(icon, CircleBaseColor::Green, CircleBaseSize::Small);
+        spr->setScale(0.85f);
         auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(RPPauseLayer::onRPOpen));
         btn->setID("replay-button"_spr);
         btn->setPosition({winSize.width - 40.f, winSize.height / 2.f});
